@@ -1,0 +1,63 @@
+	private static void Do(SparkSession spark, String inPath, String outPath) {
+		JavaRDD<String> lines = spark.read().textFile(inPath).javaRDD();
+		JavaPairRDD<String, Double[]> input = lines.mapToPair(str -> {
+			String[] strA = SPACE.split(str);
+			Double[] vec = new Double[strA.length];
+			vec[0] = 0.0d;
+			for (int i = 1; i < vec.length; i++) {
+				vec[i] = Double.parseDouble(strA[i]);
+				vec[0] += vec[i] * vec[i];
+			}
+			vec[0] = Math.sqrt(vec[0]);
+			return new Tuple2<String, Double[]>(strA[0], vec);
+		});
+		JavaPairRDD<Tuple2<String, Double[]>, Tuple2<String, Double[]>> cart = input.cartesian(input);
+		JavaPairRDD<String, Tuple2<String, String>> dis = cart.flatMapToPair(tuple -> {
+			LinkedList<Tuple2<String, Tuple2<String, String>>> list = new LinkedList<>();
+			Tuple2<String, Double[]> first = tuple._1();
+			Tuple2<String, Double[]> second = tuple._2();
+			if (first._1().compareTo(second._1()) < 0) {
+				String s = String.format("%.6f", CalculateCosine(first._2(), second._2()));
+				list.add(new Tuple2<String, Tuple2<String, String>>(first._1(),
+						new Tuple2<String, String>(second._1(), s)));
+				list.add(new Tuple2<String, Tuple2<String, String>>(second._1(),
+						new Tuple2<String, String>(first._1(), s)));
+				return list.iterator();
+			} else if (first._1().compareTo(second._1()) == 0) {
+				list.add(new Tuple2<String, Tuple2<String, String>>(second._1(),
+						new Tuple2<String, String>(first._1(), "1.000000")));
+				return list.iterator();
+			} else {
+				return list.iterator();
+			}
+		});
+		JavaPairRDD<String, String> result = dis.groupByKey().repartition(8).mapToPair(tuple -> {
+			TreeMap<String, String> map = new TreeMap<>();
+			for (Tuple2<String, String> itr : tuple._2()) {
+				map.put(itr._1(), itr._2());
+			}
+			StringBuilder sb = new StringBuilder();
+			for (String s : map.values()) {
+				sb.append(" ");
+				sb.append(s);
+			}
+			return new Tuple2<String, String>(tuple._1(), sb.toString());
+		});
+		result.sortByKey().map(tuple -> tuple._1() + tuple._2()).saveAsTextFile(outPath);
+	}
+
+	public static Double CalculateCosine(Double[] a, Double[] b) {
+		// 计算归一化余弦距离
+		if (a.length != b.length) {// 余弦距离要求两向量必须等长
+			return Double.NaN;
+		}
+		// 分别存放点积、X2开方、Y2开方
+		double PointMulti = 0.0d;
+		double Modulo1 = a[0];
+		double Modulo2 = b[0];
+		for (int i = 1; i < a.length; i++) {
+			PointMulti += a[i] * b[i];
+		}
+		// 返回相似度
+		return ((PointMulti / (Modulo1 * Modulo2)) + 1d) / 2;
+	}
