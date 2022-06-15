@@ -1,0 +1,133 @@
+public class SpectralClustering {
+	private static int EIGVEC_NUM = 2; 
+	private static int year = 2016;
+	private static String inPath = "C:\\Users\\wanghy\\Documents\\毕业论文\\实验\\数据\\Result\\DistanceTS\\" + year + ".txt";
+	private static String outPath = "C:\\Users\\wanghy\\Documents\\毕业论文\\实验\\数据\\Result\\Spectral\\" + year;
+
+	private static String[] GetInOutPath() {
+		return new String[] { "YARN", inPath, outPath, "/", "12g" };
+	}
+	private static final Pattern SPACE = Pattern.compile(" ");
+
+	public static void main(String[] args) throws Exception {
+		Logger.getLogger("org.apache.spark").setLevel(Level.WARN);
+		Logger.getLogger("org.eclipse.jetty.server").setLevel(Level.OFF);
+		String[] env = GetInOutPath(); 
+		System.out.println("Program Start: " + new Date());
+		SparkSession spark = SparkSession.builder().master(env[0]).appName("SpectralClustering")
+				.config("spark.executor.memory", env[4]).config("spark.driver.maxResultSize", "10g").getOrCreate();
+		// 查看拉普拉斯矩阵是否已被分解，是则读取分解后的特征向量矩阵及特征值向量，否则计算拉普拉斯矩阵并分解
+		File SVD = new File(env[2] + env[3] + "SVD");
+		if (SVD.exists()) {
+			// 读取拉普拉斯矩阵分解后的特征向量矩阵及特征值向量，提取最小的前EIGVEC_NUM个向量，进行K-means聚类
+			try {
+				Clustering(spark, env, EIGVEC_NUM);
+			} catch (Exception exc0) {
+				System.exit(0);
+			}
+		} else {
+			// 读入距离文件，并添加行号
+			JavaPairRDD<String, Long> lines = spark.read().textFile(env[1]).javaRDD().zipWithIndex();
+			int size = (int) lines.count(); // 数据的行数，即，维度
+			// 按行分别生成距离矩阵、度矩阵、单位矩阵的行向量，以及数据的Label
+			JavaPairRDD<Long, Tuple4<String, Vector, Vector, Vector>> row = lines.repartition(8).mapToPair(tuple -> {
+				String content = tuple._1();
+				int id = tuple._2().intValue();
+				String[] strA = SPACE.split(content);
+				// 分别为距离矩阵、度矩阵、单位矩阵
+				double[] Wvec = new double[strA.length - 1];
+				double[] Dvec = new double[strA.length - 1];
+				double[] Ivec = new double[strA.length - 1];
+				double sum = 0.0d; // 计算该行数据的度
+				for (int i = 0; i < Wvec.length; i++) {
+					Wvec[i] = (Double.parseDouble(strA[i + 1]) + 1.0d) / 2.0d; 
+					sum += Wvec[i];
+				}
+				Dvec[id] = Math.pow(sum, -0.5); // D^-0.5，
+				Ivec[id] = 1.0d;
+				return new Tuple2<Long, Tuple4<String, Vector, Vector, Vector>>(tuple._2(),
+						new Tuple4<>(strA[0], Vectors.dense(Wvec), Vectors.dense(Dvec), Vectors.dense(Ivec)));
+			});
+			lines = null;
+			row.map(tuple -> new Tuple2<Long, String>(tuple._1(), tuple._2()._1()))
+					.saveAsObjectFile(env[2] + env[3] + "Label");
+			System.out.println("RowID & Label Output Complete, Start Calculating Laplace Matrix:" + new Date());
+			// 按相应行向量，分别生成距离矩阵、度矩阵（负二分之一次方）、单位矩阵
+			JavaRDD<IndexedRow> Wrow = row.map(tuple -> new IndexedRow(tuple._1(), tuple._2()._2()));
+			JavaRDD<IndexedRow> Drow = row.map(tuple -> new IndexedRow(tuple._1(), tuple._2()._3()));
+			JavaRDD<IndexedRow> Irow = row.map(tuple -> new IndexedRow(tuple._1(), tuple._2()._4()));
+			row = null;
+			IndexedRowMatrix W = new IndexedRowMatrix(Wrow.rdd());
+			IndexedRowMatrix D = new IndexedRowMatrix(Drow.rdd());
+			IndexedRowMatrix I = new IndexedRowMatrix(Irow.rdd());
+			// 计算拉普拉斯矩阵，按照分块矩阵进行矩阵减法和矩阵乘法
+			BlockMatrix D_B = D.toBlockMatrix();
+			BlockMatrix L_B = I.toBlockMatrix().subtract(D_B.multiply(W.toBlockMatrix()).multiply(D_B));
+			W = null;
+			D = null;
+			I = null;
+			IndexedRowMatrix L = L_B.toIndexedRowMatrix(); // 转分块矩阵为分布式矩阵，以便进行分解
+			D_B = null;
+			L_B = null;
+			System.out.println("Laplace Matrix Calculate Complete:" + new Date());
+			// 奇异值分解，对于半正定矩阵Lsym等价于其特征值分解
+			SingularValueDecomposition<IndexedRowMatrix, Matrix> svd = L.computeSVD(size, false, 1.0e-9d);
+			System.out.println("Singular Value Decomposition Complete:" + new Date());
+			ObjectOutputStream oboutst = new ObjectOutputStream(new FileOutputStream(env[2] + env[3] + "SVD"));
+			oboutst.writeObject(svd.s());
+			oboutst.writeObject(svd.V());
+			oboutst.close();
+			System.out.println("Please restart program to run K-means Clustering");
+		}
+	}
+
+	private static void Clustering(SparkSession spark, String[] env, int topK) throws Exception {
+		JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark.sparkContext());
+		JavaRDD<Tuple2<Long, String>> lable = jsc.objectFile(env[2] + env[3] + "Label");
+		int size = (int) lable.count(); // 数据的行数，即，维度
+		ObjectInputStream obinst = new ObjectInputStream(new FileInputStream(env[2] + env[3] + "SVD"));
+		final Vector SVD_S = (Vector) obinst.readObject();
+		final Matrix SVD_V = (Matrix) obinst.readObject();
+		obinst.close();
+		int i = size - 1;
+		for (; i >= 0; i--) {
+			if (!String.format("%.6f", SVD_S.apply(i)).equals("0.000000"))
+				break;
+		}
+		final int index = i;
+		System.out.println(size - 1 + "\t" + index);
+		// 构造Spark Mllib需要的K-means输入
+		JavaPairRDD<String, Vector> vectors = lable.mapToPair(tuple -> {
+			int id = tuple._1().intValue();
+			double[] vec = new double[topK];
+			for (int j = 0; j < topK; j++) {
+				vec[j] = SVD_V.apply(id, index - j);
+			}
+			return new Tuple2<String, Vector>(tuple._2(), Vectors.dense(vec));
+		}).sortByKey();
+		JavaRDD<Vector> input = vectors.map(tuple -> tuple._2()).cache();
+		System.out.println("Start Clustering: " + new Date());
+		int ClusterNumStart = 2; // 聚类个数从2设置到16
+		int ClusterNumEnd = 16;
+		int numIterations = 30; // 单次运行最大的迭代次数
+		Double[] costs = new Double[ClusterNumEnd - ClusterNumStart + 1];
+		for (int numClusters = ClusterNumStart; numClusters <= ClusterNumEnd; numClusters++) {
+			KMeansModel kmeans = KMeans.train(input.rdd(), numClusters, numIterations);
+			double cost = kmeans.computeCost(input.rdd()); 
+			System.out.println("Kmeans:\tk=" + numClusters + "\tCost=" + cost);
+			costs[numClusters - ClusterNumStart] = cost;
+			vectors.map(tuple -> {
+				return tuple._1() + "\t" + kmeans.predict(tuple._2());
+			}).saveAsTextFile(env[2] + env[3] + "SIGMA_" + topK + env[3] + "ClusterNum_" + numClusters);
+		}
+		PrintStream ps = new PrintStream(
+					env[2] + env[3] + "SIGMA_" + topK + env[3] + "ClusterCost_" + topK + ".txt");
+		for (int numClusters = ClusterNumStart; numClusters <= ClusterNumEnd; numClusters++) {
+			ps.println("k=" + numClusters + "\t" + costs[numClusters - ClusterNumStart]);
+		}
+		ps.close();
+		// 调用JFreeChart绘制聚类个数与误差平方和的手肘状变化关系的图形
+		drawLineChart("ClusterNum & Cost", "ClusterNum", "Cost", costs, ClusterNumStart, true,
+				env[2] + env[3] + "SIGMA_" + topK + env[3] + "ClusterCost_" + topK + ".jpg");
+	}
+}
